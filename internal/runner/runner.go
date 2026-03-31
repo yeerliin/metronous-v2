@@ -79,11 +79,11 @@ func (r *Runner) RunWeekly(ctx context.Context, windowDays int) error {
 
 	r.logger.Info("discovered agents", zap.Strings("agents", agents))
 
-	// Compute metrics and evaluate for each agent; collect results before saving.
+	// Compute metrics and evaluate for each agent+model combination; collect results before saving.
 	var results []agentResult
 	var failedAgents []string
 	for _, agentID := range agents {
-		res, err := r.processAgent(ctx, agentID, start, end, windowDays)
+		agentResults, err := r.processAgent(ctx, agentID, start, end, windowDays)
 		if err != nil {
 			r.logger.Error("failed to process agent",
 				zap.String("agent_id", agentID),
@@ -92,7 +92,7 @@ func (r *Runner) RunWeekly(ctx context.Context, windowDays int) error {
 			failedAgents = append(failedAgents, agentID)
 			continue
 		}
-		results = append(results, res)
+		results = append(results, agentResults...)
 	}
 
 	// Generate consolidated artifact for all verdicts so the path is available
@@ -135,52 +135,82 @@ func (r *Runner) RunWeekly(ctx context.Context, windowDays int) error {
 	return nil
 }
 
-// processAgent computes metrics and evaluates the verdict for a single agent.
-// It returns an agentResult with a fully-populated BenchmarkRun (ArtifactPath is
-// left empty — RunWeekly sets it after the artifact file is written).
-func (r *Runner) processAgent(ctx context.Context, agentID string, start, end time.Time, windowDays int) (agentResult, error) {
-	// 1. Fetch events for the window.
+// processAgent computes metrics and evaluates the verdict for each model used
+// by a single agent. Events are grouped by model so each (agent_id, model)
+// combination gets its own independent benchmark run with separate metrics.
+// Returns one agentResult per model (ArtifactPath is left empty — RunWeekly
+// sets it after the artifact file is written).
+func (r *Runner) processAgent(ctx context.Context, agentID string, start, end time.Time, windowDays int) ([]agentResult, error) {
+	// 1. Fetch all events for the agent in the window.
 	events, err := benchmark.FetchEventsForWindow(ctx, r.eventStore, agentID, start, end)
 	if err != nil {
-		return agentResult{}, fmt.Errorf("fetch events for %q: %w", agentID, err)
+		return nil, fmt.Errorf("fetch events for %q: %w", agentID, err)
 	}
 
-	// 2. Aggregate metrics.
-	metrics := benchmark.AggregateMetrics(r.logger, agentID, events)
+	// 2. Group events by model — each group gets independent metrics.
+	modelGroups := benchmark.GroupEventsByModel(events)
 
-	// 3. Evaluate thresholds → verdict.
-	verdict := r.engine.Evaluate(ctx, metrics)
+	var results []agentResult
+	for model, modelEvents := range modelGroups {
+		// 3. Aggregate metrics for this (agent, model) pair.
+		metrics := benchmark.AggregateMetrics(r.logger, agentID, modelEvents)
+		// Override Model to the exact model for this group (AggregateMetrics
+		// uses dominantModel which is redundant here since all events share
+		// the same model, but we set it explicitly for clarity).
+		metrics.Model = model
 
-	// 4. Build the BenchmarkRun (not yet saved — ArtifactPath filled by caller).
-	run := store.BenchmarkRun{
-		RunAt:            time.Now().UTC(),
-		WindowDays:       windowDays,
-		AgentID:          agentID,
-		Model:            metrics.Model,
-		Accuracy:         metrics.Accuracy,
-		AvgLatencyMs:     metrics.AvgLatencyMs,
-		P50LatencyMs:     metrics.P50LatencyMs,
-		P95LatencyMs:     metrics.P95LatencyMs,
-		P99LatencyMs:     metrics.P99LatencyMs,
-		ToolSuccessRate:  metrics.ToolSuccessRate,
-		ROIScore:         metrics.ROIScore,
-		TotalCostUSD:     metrics.TotalCostUSD,
-		SampleSize:       metrics.SampleSize,
-		Verdict:          verdict.Type,
-		RecommendedModel: verdict.RecommendedModel,
-		DecisionReason:   verdict.Reason,
-		AvgQualityScore:  metrics.AvgQuality,
-		// ArtifactPath is set by RunWeekly after GenerateArtifact completes.
+		// 4. Evaluate thresholds → verdict.
+		//    The engine resolves per-agent thresholds using agentID —
+		//    the model is the VARIABLE being evaluated, not the threshold key.
+		verdict := r.engine.Evaluate(ctx, metrics)
+
+		// 5. Build the BenchmarkRun.
+		run := store.BenchmarkRun{
+			RunAt:            time.Now().UTC(),
+			WindowDays:       windowDays,
+			AgentID:          agentID,
+			Model:            model,
+			Accuracy:         metrics.Accuracy,
+			AvgLatencyMs:     metrics.AvgLatencyMs,
+			P50LatencyMs:     metrics.P50LatencyMs,
+			P95LatencyMs:     metrics.P95LatencyMs,
+			P99LatencyMs:     metrics.P99LatencyMs,
+			ToolSuccessRate:  metrics.ToolSuccessRate,
+			ROIScore:         metrics.ROIScore,
+			TotalCostUSD:     metrics.TotalCostUSD,
+			SampleSize:       metrics.SampleSize,
+			Verdict:          verdict.Type,
+			RecommendedModel: verdict.RecommendedModel,
+			DecisionReason:   verdict.Reason,
+			AvgQualityScore:  metrics.AvgQuality,
+			// ArtifactPath is set by RunWeekly after GenerateArtifact completes.
+		}
+
+		r.logger.Info("agent+model benchmark complete",
+			zap.String("agent_id", agentID),
+			zap.String("model", model),
+			zap.String("verdict", string(verdict.Type)),
+			zap.Int("sample_size", metrics.SampleSize),
+		)
+
+		results = append(results, agentResult{verdict: verdict, run: run})
 	}
 
-	r.logger.Info("agent benchmark complete",
-		zap.String("agent_id", agentID),
-		zap.String("model", metrics.Model),
-		zap.String("verdict", string(verdict.Type)),
-		zap.Int("sample_size", metrics.SampleSize),
-	)
+	// If the agent had zero events, return a single empty result so the
+	// caller can still log it (backward compat with single-model agents).
+	if len(results) == 0 {
+		metrics := benchmark.AggregateMetrics(r.logger, agentID, nil)
+		verdict := r.engine.Evaluate(ctx, metrics)
+		run := store.BenchmarkRun{
+			RunAt:      time.Now().UTC(),
+			WindowDays: windowDays,
+			AgentID:    agentID,
+			Verdict:    verdict.Type,
+		}
+		results = append(results, agentResult{verdict: verdict, run: run})
+	}
 
-	return agentResult{verdict: verdict, run: run}, nil
+	return results, nil
 }
 
 // discoverAgents returns distinct agent IDs from events within the given window.
