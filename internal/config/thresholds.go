@@ -79,6 +79,10 @@ type Thresholds struct {
 
 	// PerAgent maps agent IDs to agent-specific threshold overrides.
 	PerAgent map[string]AgentThresholds `json:"per_agent,omitempty"`
+
+	// ScoreWeights defines the weights for composite score calculation.
+	// If the section is absent from JSON, use DefaultScoreWeights().
+	ScoreWeights ScoreWeights `json:"score_weights,omitempty"`
 }
 
 // DefaultThresholdValues returns a Thresholds struct populated with the
@@ -103,7 +107,8 @@ func DefaultThresholdValues() Thresholds {
 			PerformanceModel: "claude-haiku-4-5",
 			DefaultModel:     "claude-sonnet-4-5",
 		},
-		PerAgent: make(map[string]AgentThresholds),
+		PerAgent:     make(map[string]AgentThresholds),
+		ScoreWeights: DefaultScoreWeights(),
 	}
 }
 
