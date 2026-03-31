@@ -2,7 +2,10 @@
 // It is only compiled during testing.
 package tui
 
-import "github.com/kiosvantra/metronous/internal/config"
+import (
+	"github.com/kiosvantra/metronous/internal/config"
+	"github.com/kiosvantra/metronous/internal/store"
+)
 
 // TrackingSessionEventsMsg exports the internal trackingSessionEventsMsg for tests.
 type TrackingSessionEventsMsg = trackingSessionEventsMsg
@@ -39,6 +42,37 @@ func GetBenchmarkDetailFrozen(m BenchmarkModel) bool {
 // GetBenchmarkFrozenRun returns the frozen run for tests.
 func GetBenchmarkFrozenRun(m BenchmarkModel) interface{} {
 	return m.frozenRun
+}
+
+// FormatBenchmarkRowForTest exposes formatBenchmarkRow for testing.
+func FormatBenchmarkRowForTest(run store.BenchmarkRun, agentType string, pricing map[string]float64) []string {
+	return formatBenchmarkRow(run, agentType, pricing)
+}
+
+// BenchColNames exposes benchColNames for index verification.
+func BenchColNames() []string {
+	return benchColNames
+}
+
+// BenchColWidths exposes benchColWidths for index verification.
+func BenchColWidths() []int {
+	return benchColWidths
+}
+
+// VerdictColIdx exposes verdictColIdx for index verification.
+const VerdictColIdxForTest = verdictColIdx
+
+// ScoreColIdx is the expected index of the Score column.
+const ScoreColIdx = 3
+
+// GetBenchmarkComparing returns whether comparison mode is active.
+func GetBenchmarkComparing(m BenchmarkModel) bool {
+	return m.comparing
+}
+
+// GetBenchmarkComparisonResult returns the stored comparison result.
+func GetBenchmarkComparisonResult(m BenchmarkModel) interface{} {
+	return m.comparisonResult
 }
 
 // --- Tracking session helpers (for tests) ---
