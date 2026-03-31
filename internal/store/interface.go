@@ -252,6 +252,9 @@ type BenchmarkRun struct {
 
 	// AvgQualityScore is the mean quality_score across all rated events in the window.
 	AvgQualityScore float64
+
+	// CompositeScore is the normalized 0-1 composite score combining all metrics.
+	CompositeScore float64
 }
 
 // BenchmarkQuery defines filter criteria for querying benchmark runs.
@@ -293,9 +296,20 @@ type BenchmarkStore interface {
 	// ListAgents returns the distinct agent IDs that have at least one run.
 	ListAgents(ctx context.Context) ([]string, error)
 
+	// ListAgentModels returns the distinct (agent_id, model) pairs that have runs.
+	ListAgentModels(ctx context.Context) ([][2]string, error)
+
+	// GetLatestRunByAgentModel returns the most recent run for a specific
+	// (agent_id, model) combination, or nil if none exists.
+	GetLatestRunByAgentModel(ctx context.Context, agentID, model string) (*BenchmarkRun, error)
+
 	// GetVerdictTrend returns the last N weekly verdicts for the given agent,
 	// ordered oldest first. Returns an empty slice if no runs exist.
 	GetVerdictTrend(ctx context.Context, agentID string, weeks int) ([]string, error)
+
+	// GetVerdictTrendByModel returns the last N weekly verdicts for a specific
+	// (agent_id, model) combination, ordered oldest first.
+	GetVerdictTrendByModel(ctx context.Context, agentID, model string, weeks int) ([]string, error)
 
 	// Close releases all resources held by the store.
 	Close() error

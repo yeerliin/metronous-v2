@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS benchmark_runs (
     recommended_model TEXT NOT NULL DEFAULT '',
     decision_reason   TEXT NOT NULL DEFAULT '',
     artifact_path     TEXT NOT NULL DEFAULT '',
-    avg_quality_score REAL NOT NULL DEFAULT 0.0
+    avg_quality_score REAL NOT NULL DEFAULT 0.0,
+    composite_score   REAL NOT NULL DEFAULT 0.0
 );
 
 -- Indexes for common queries
@@ -48,6 +49,8 @@ CREATE INDEX IF NOT EXISTS idx_benchmark_agent_model ON benchmark_runs(agent_id,
 // Each migration is guarded by checking for the column's existence first (SQLite
 // returns an error on duplicate column add, which we ignore).
 const addAvgQualityScoreColumn = `ALTER TABLE benchmark_runs ADD COLUMN avg_quality_score REAL NOT NULL DEFAULT 0.0`
+
+const addCompositeScoreColumn = `ALTER TABLE benchmark_runs ADD COLUMN composite_score REAL NOT NULL DEFAULT 0.0`
 
 // BenchmarkStore is a SQLite-backed implementation of store.BenchmarkStore.
 type BenchmarkStore struct {
@@ -109,6 +112,11 @@ func ApplyBenchmarkMigrations(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("apply avg_quality_score migration: %w", err)
 		}
 	}
+	if _, err := db.ExecContext(ctx, addCompositeScoreColumn); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("apply composite_score migration: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -123,12 +131,14 @@ func (bs *BenchmarkStore) SaveRun(ctx context.Context, run store.BenchmarkRun) e
 			id, run_at, window_days, agent_id, model,
 			accuracy, avg_latency_ms, p50_latency_ms, p95_latency_ms, p99_latency_ms,
 			tool_success_rate, roi_score, total_cost_usd, sample_size,
-			verdict, recommended_model, decision_reason, artifact_path, avg_quality_score
+			verdict, recommended_model, decision_reason, artifact_path, avg_quality_score,
+			composite_score
 		) VALUES (
 			?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?,
 			?, ?, ?, ?,
-			?, ?, ?, ?, ?
+			?, ?, ?, ?, ?,
+			?
 		)`
 
 	_, err := bs.writeDB.ExecContext(ctx, q,
@@ -151,6 +161,7 @@ func (bs *BenchmarkStore) SaveRun(ctx context.Context, run store.BenchmarkRun) e
 		run.DecisionReason,
 		run.ArtifactPath,
 		run.AvgQualityScore,
+		run.CompositeScore,
 	)
 	if err != nil {
 		return fmt.Errorf("save benchmark run: %w", err)
@@ -183,7 +194,8 @@ func (bs *BenchmarkStore) GetRuns(ctx context.Context, agentID string, limit int
 	q := `SELECT id, run_at, window_days, agent_id, model,
 		accuracy, avg_latency_ms, p50_latency_ms, p95_latency_ms, p99_latency_ms,
 		tool_success_rate, roi_score, total_cost_usd, sample_size,
-		verdict, recommended_model, decision_reason, artifact_path, avg_quality_score
+		verdict, recommended_model, decision_reason, artifact_path, avg_quality_score,
+		composite_score
 		FROM benchmark_runs`
 
 	if len(conditions) > 0 {
@@ -223,7 +235,8 @@ func (bs *BenchmarkStore) QueryRuns(ctx context.Context, query store.BenchmarkQu
 	q := `SELECT id, run_at, window_days, agent_id, model,
 		accuracy, avg_latency_ms, p50_latency_ms, p95_latency_ms, p99_latency_ms,
 		tool_success_rate, roi_score, total_cost_usd, sample_size,
-		verdict, recommended_model, decision_reason, artifact_path, avg_quality_score
+		verdict, recommended_model, decision_reason, artifact_path, avg_quality_score,
+		composite_score
 		FROM benchmark_runs`
 
 	if len(conditions) > 0 {
@@ -275,7 +288,8 @@ func (bs *BenchmarkStore) GetLatestRun(ctx context.Context, agentID string) (*st
 	const q = `SELECT id, run_at, window_days, agent_id, model,
 		accuracy, avg_latency_ms, p50_latency_ms, p95_latency_ms, p99_latency_ms,
 		tool_success_rate, roi_score, total_cost_usd, sample_size,
-		verdict, recommended_model, decision_reason, artifact_path, avg_quality_score
+		verdict, recommended_model, decision_reason, artifact_path, avg_quality_score,
+		composite_score
 		FROM benchmark_runs
 		WHERE agent_id = ?
 		ORDER BY run_at DESC
@@ -374,6 +388,7 @@ func scanBenchmarkRuns(rows *sql.Rows) ([]store.BenchmarkRun, error) {
 			&run.DecisionReason,
 			&run.ArtifactPath,
 			&run.AvgQualityScore,
+			&run.CompositeScore,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan benchmark run row: %w", err)
@@ -420,6 +435,7 @@ func scanBenchmarkRun(row rowScanner) (*store.BenchmarkRun, error) {
 		&run.DecisionReason,
 		&run.ArtifactPath,
 		&run.AvgQualityScore,
+		&run.CompositeScore,
 	)
 	if err != nil {
 		return nil, err
@@ -427,6 +443,90 @@ func scanBenchmarkRun(row rowScanner) (*store.BenchmarkRun, error) {
 	run.RunAt = time.UnixMilli(runAtMs).UTC()
 	run.Verdict = store.VerdictType(verdict)
 	return &run, nil
+}
+
+// ListAgentModels returns the distinct (agent_id, model) pairs that have at least one benchmark run.
+func (bs *BenchmarkStore) ListAgentModels(ctx context.Context) ([][2]string, error) {
+	const q = `SELECT DISTINCT agent_id, model FROM benchmark_runs ORDER BY agent_id, model`
+
+	rows, err := bs.readDB.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("list agent-model pairs: %w", err)
+	}
+	defer rows.Close()
+
+	var pairs [][2]string
+	for rows.Next() {
+		var agentID, model string
+		if err := rows.Scan(&agentID, &model); err != nil {
+			return nil, fmt.Errorf("scan agent-model pair: %w", err)
+		}
+		pairs = append(pairs, [2]string{agentID, model})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate agent-model rows: %w", err)
+	}
+	return pairs, nil
+}
+
+// GetLatestRunByAgentModel returns the most recent benchmark run for a specific
+// (agent_id, model) combination, or nil if none exists.
+func (bs *BenchmarkStore) GetLatestRunByAgentModel(ctx context.Context, agentID, model string) (*store.BenchmarkRun, error) {
+	const q = `SELECT id, run_at, window_days, agent_id, model,
+		accuracy, avg_latency_ms, p50_latency_ms, p95_latency_ms, p99_latency_ms,
+		tool_success_rate, roi_score, total_cost_usd, sample_size,
+		verdict, recommended_model, decision_reason, artifact_path, avg_quality_score,
+		composite_score
+		FROM benchmark_runs
+		WHERE agent_id = ? AND model = ?
+		ORDER BY run_at DESC
+		LIMIT 1`
+
+	row := bs.readDB.QueryRowContext(ctx, q, agentID, model)
+	run, err := scanBenchmarkRun(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get latest benchmark run for %q/%q: %w", agentID, model, err)
+	}
+	return run, nil
+}
+
+// GetVerdictTrendByModel returns the last N weekly verdicts for a specific
+// (agent_id, model) combination, ordered oldest first.
+func (bs *BenchmarkStore) GetVerdictTrendByModel(ctx context.Context, agentID, model string, weeks int) ([]string, error) {
+	if weeks <= 0 {
+		return nil, nil
+	}
+	const q = `SELECT verdict FROM benchmark_runs
+		WHERE agent_id = ? AND model = ?
+		ORDER BY run_at DESC
+		LIMIT ?`
+
+	rows, err := bs.readDB.QueryContext(ctx, q, agentID, model, weeks)
+	if err != nil {
+		return nil, fmt.Errorf("get verdict trend for %q/%q: %w", agentID, model, err)
+	}
+	defer rows.Close()
+
+	var verdicts []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("scan verdict: %w", err)
+		}
+		verdicts = append(verdicts, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate verdict rows: %w", err)
+	}
+
+	// Reverse to get oldest-first order.
+	for i, j := 0, len(verdicts)-1; i < j; i, j = i+1, j-1 {
+		verdicts[i], verdicts[j] = verdicts[j], verdicts[i]
+	}
+	return verdicts, nil
 }
 
 // GetVerdictTrend returns the last N weekly verdicts for the given agent, ordered oldest first.
