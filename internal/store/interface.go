@@ -6,8 +6,21 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 )
+
+// NormalizeModelName strips well-known provider prefixes from model identifiers
+// so that "opencode/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6" and
+// "claude-sonnet-4-6" are treated as the same model across all stores.
+func NormalizeModelName(model string) string {
+	for _, prefix := range []string{"opencode/", "anthropic/", "ollama-cloud/", "ollama/"} {
+		if strings.HasPrefix(model, prefix) {
+			return model[len(prefix):]
+		}
+	}
+	return model
+}
 
 // Event represents a single telemetry event ingested from an AI agent session.
 // Fields are aligned with the MCP ingest tool schema.
@@ -127,6 +140,18 @@ type SessionSummary struct {
 
 	// CostUSD is the total cost for the session (nullable).
 	CostUSD *float64
+
+	// DurationMs is the duration of the session in milliseconds (nullable).
+	// It is populated from the session's `complete` event when present.
+	DurationMs *int
+}
+
+// DailyCostByModelRow represents aggregated daily spend per model
+// for events with event_type='complete'.
+type DailyCostByModelRow struct {
+	Day          time.Time
+	Model        string
+	TotalCostUSD float64
 }
 
 // SessionQuery defines filter criteria for querying sessions.
@@ -173,6 +198,13 @@ type EventStore interface {
 	// GetAgentSummary returns aggregated metrics for the specified agent.
 	GetAgentSummary(ctx context.Context, agentID string) (AgentSummary, error)
 
+	// QueryDailyCostByModel aggregates total cost (USD) per model per local-day
+	// for events in the supplied time window. The day bucket is computed in
+	// the process-local timezone (time.Local).
+	// Implementations must treat the window as [since, until) and only consider
+	// events where event_type='complete'.
+	QueryDailyCostByModel(ctx context.Context, since, until time.Time) ([]DailyCostByModelRow, error)
+
 	// Close releases all resources held by the store.
 	Close() error
 }
@@ -194,7 +226,27 @@ const (
 	VerdictInsufficientData VerdictType = "INSUFFICIENT_DATA"
 )
 
-// BenchmarkRun holds all metrics and the verdict for a single weekly benchmark run.
+// RunKindType distinguishes how a benchmark run was triggered.
+type RunKindType string
+
+const (
+	// RunKindWeekly is the scheduled Sunday cron run.
+	RunKindWeekly RunKindType = "weekly"
+	// RunKindIntraweek is a manual on-demand run triggered outside the cron schedule.
+	RunKindIntraweek RunKindType = "intraweek"
+)
+
+// RunStatus indicates whether a benchmark run is currently active or has been superseded.
+type RunStatus string
+
+const (
+	// RunStatusActive is the default for new runs and active models.
+	RunStatusActive RunStatus = "active"
+	// RunStatusSuperseded indicates the model was replaced by a newer model in the same cycle.
+	RunStatusSuperseded RunStatus = "superseded"
+)
+
+// BenchmarkRun holds all metrics and the verdict for a single benchmark run.
 type BenchmarkRun struct {
 	// ID is a UUID v4 generated at save time.
 	ID string
@@ -202,7 +254,18 @@ type BenchmarkRun struct {
 	// RunAt is when this benchmark was computed (UTC).
 	RunAt time.Time
 
+	// RunKind distinguishes a scheduled weekly run from a manual intraweek run.
+	// Defaults to RunKindWeekly for backward compatibility.
+	RunKind RunKindType
+
+	// WindowStart is the inclusive start of the event window used for this run (UTC).
+	WindowStart time.Time
+
+	// WindowEnd is the exclusive end of the event window used for this run (UTC).
+	WindowEnd time.Time
+
 	// WindowDays is the number of days in the evaluation window (default 7).
+	// For intraweek runs this is approximate; prefer WindowStart/WindowEnd for auditing.
 	WindowDays int
 
 	// AgentID identifies the agent that was benchmarked.
@@ -210,6 +273,10 @@ type BenchmarkRun struct {
 
 	// Model is the LLM model the agent was using during the window.
 	Model string
+
+	// RawModel is the un-normalized model name with provider prefix (e.g., "opencode/claude-sonnet-4-6").
+	// Populated at benchmark time from the most frequent raw model name seen in the event window.
+	RawModel string
 
 	// Accuracy is the ratio of non-error events to total events (0.0–1.0).
 	Accuracy float64
@@ -251,10 +318,54 @@ type BenchmarkRun struct {
 	ArtifactPath string
 
 	// AvgQualityScore is the mean quality_score across all rated events in the window.
+	// Deprecated: quality_score has <11% coverage and duplicates accuracy. Kept for
+	// backward compatibility.
 	AvgQualityScore float64
+
+	// AvgPromptTokens is the mean number of prompt tokens per complete event.
+	AvgPromptTokens float64
+
+	// AvgCompletionTokens is the mean number of completion tokens per complete event.
+	AvgCompletionTokens float64
+
+	// AvgTurnMs is the mean turn duration in milliseconds (complete events only).
+	AvgTurnMs float64
+
+	// P95TurnMs is the 95th-percentile turn duration in milliseconds (complete events only).
+	P95TurnMs float64
 
 	// CompositeScore is the normalized 0-1 composite score combining all metrics.
 	CompositeScore float64
+
+	// Status indicates whether this run is active or has been superseded by a newer model.
+	// Defaults to RunStatusActive.
+	Status RunStatus
+}
+
+// BenchmarkModelSummary aggregates benchmark metrics per model across all agents.
+// It is used by the Charts tab to rank models for the different visualization modes.
+type BenchmarkModelSummary struct {
+	// Model is the LLM model identifier.
+	Model string
+
+	// Runs is the number of benchmark runs included in the summary.
+	Runs int
+
+	// AvgAccuracy is the sample-weighted average accuracy across qualifying runs.
+	AvgAccuracy float64
+
+	// AvgP95Ms is the sample-weighted average P95 latency across qualifying runs.
+	AvgP95Ms float64
+
+	// TotalCostUSD is the cost from the run used for LastVerdict.
+	TotalCostUSD float64
+
+	// LastVerdict is the most recent non-insufficient verdict, falling back to
+	// INSUFFICIENT_DATA when no better run exists.
+	LastVerdict VerdictType
+
+	// LastRunAt is the timestamp of the run that produced LastVerdict.
+	LastRunAt time.Time
 }
 
 // BenchmarkQuery defines filter criteria for querying benchmark runs.
@@ -310,6 +421,21 @@ type BenchmarkStore interface {
 	// GetVerdictTrendByModel returns the last N weekly verdicts for a specific
 	// (agent_id, model) combination, ordered oldest first.
 	GetVerdictTrendByModel(ctx context.Context, agentID, model string, weeks int) ([]string, error)
+
+	// ListRunCycles returns the distinct week-start timestamps (Sunday 00:00 local time,
+	// stored as UTC) for all benchmark runs, ordered newest first.
+	ListRunCycles(ctx context.Context, loc *time.Location, limit, offset int) ([]time.Time, error)
+
+	// QueryModelSummaries returns one aggregated row per model across all benchmark runs.
+	QueryModelSummaries(ctx context.Context) ([]BenchmarkModelSummary, error)
+
+	// QueryRunsInWindow returns all benchmark runs whose run_at falls within
+	// [since, until) (inclusive start, exclusive end), ordered by run_at DESC.
+	QueryRunsInWindow(ctx context.Context, since, until time.Time) ([]BenchmarkRun, error)
+
+	// MarkSupersededRuns marks older intraweek runs of the same model as superseded
+	// when a newer run of that model is created in the same cycle.
+	MarkSupersededRuns(ctx context.Context, agentID string, newRunAt time.Time, newModel string, cycleStart, cycleEnd time.Time) error
 
 	// Close releases all resources held by the store.
 	Close() error
